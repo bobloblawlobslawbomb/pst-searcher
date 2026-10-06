@@ -1,0 +1,21 @@
+# build output
+/target
+**/target/
+/dist
+
+# test data: large and regenerable with pstgen (see README)
+/corpus
+*.pst
+*.ost
+
+# runtime state
+*.db
+*.db-wal
+*.db-shm
+/exported/
+
+# scratch
+*.log
+*.png
+__pycache__/
+*.pyc

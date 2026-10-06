@@ -1,0 +1,10 @@
+[package]
+name = "pstgen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+outlook-pst-rw = "1.2.9"
+
+[profile.release]
+opt-level = 3

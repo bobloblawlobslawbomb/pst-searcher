@@ -1,0 +1,35 @@
+[package]
+name = "pst-rs-probe"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "pstsearch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pst-searcher"
+path = "src/bin/gui.rs"
+
+[[bin]]
+name = "pst-cli"
+path = "src/bin/pst-cli.rs"
+
+[[bin]]
+name = "pst-probe"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.36.2"
+outlook-pst = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+# native file/folder picker (Windows COM dialogs; xdg-portal is inert off Linux)
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
