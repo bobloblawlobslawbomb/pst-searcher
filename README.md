@@ -48,6 +48,55 @@ Clean text is kept separately for export and the copy button.
 `att_names` is 5. Passing the wrong index silently returns the wrong column's text — the first
 build of this pane rendered attachment filenames as the message body because of exactly that.
 
+## Leaving nothing behind
+
+The index holds every message body it has read, which is exactly what you do not want sitting on a
+review machine afterwards. Tick **Delete the index when this window closes** and the app removes the
+database (with its `-wal`/`-shm` sidecars) on the way out; the second checkbox, **…and the exported
+.eml files**, extends that to the exports it wrote.
+
+```
+[ ] Delete the index when this window closes
+[ ] …and the exported .eml files        on close: remove the index - your PST files are never touched
+```
+
+The choice is saved in `settings.json` next to the index, so it survives a restart:
+
+```json
+{
+  "clean_on_exit": true,
+  "clean_exports": false
+}
+```
+
+For scripted or one-off use, `--clean-on-exit` (and `--clean-exports`) force it for a single run
+without touching the saved choice. In the CLI, `--clean`, `--clean-index` and `--clean-exports`
+delete immediately and print what went, e.g.
+
+```
+$ pst-cli.exe --clean
+removed 6 file(s), 19425.2 KB
+  - C:\cases\index.db
+  - C:\cases\index.db-wal
+  - C:\cases\index.db-shm
+  - C:\cases\exported\000123_termination-notice.eml
+  - ...
+```
+
+**What cleanup will never touch:** the source `.pst`/`.ost` files. It unlinks only three exact paths
+derived from the index path, plus `.eml` files in the app's own export folder - anything else in
+those folders is left alone and reported as `! kept (not an export): ...`. Deleting a file is not
+undoable, so the option is off by default and the UI states what it will remove before you turn it on.
+
+Two honest limits:
+
+- **Closing mid-index.** If indexing is still running, the worker thread holds the database open and
+  Windows will not unlink an open file. The app waits up to five seconds for the worker, then tries
+  anyway; if a file is still locked it survives the close and is reported on stderr instead of being
+  silently left behind.
+- **A crash or `taskkill` skips it entirely** - the cleanup runs on a normal window close, not on
+  process death. Use the CLI `--clean` afterwards in that case.
+
 ## Test corpus (generated locally; `corpus/` is not committed)
 
 | File | Size | Contents |
@@ -161,6 +210,7 @@ CLI (bulk ingest / scripting / CI — identical index and search code):
 pst-cli.exe --db C:\cases\index.db --index C:\cases\export      # ingest a file, or every PST under a folder
 pst-cli.exe --db C:\cases\index.db --search "invoice AND contract"
 pst-cli.exe --counts                                              # index stats
+pst-cli.exe --clean                                               # delete the index + exported .eml
 pst-cli.exe --help
 ```
 

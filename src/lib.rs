@@ -472,3 +472,173 @@ pub fn open_index(explicit: Option<PathBuf>) -> Result<(Connection, PathBuf, Opt
     }
     Err(errors.join("  |  "))
 }
+
+// ---------------------------------------------------------------------------
+// Cleaning up after ourselves
+//
+// The index holds every message body, so a review machine may not want it still
+// sitting there after the app closes. Everything below touches *only* files this
+// app created: the index database (three exact paths derived from it) and .eml
+// files inside its own export folder. Source PST/OST files are never candidates,
+// and neither is anything else that happens to share a folder with them.
+// ---------------------------------------------------------------------------
+
+/// Options that persist between runs, stored as `settings.json` beside the index.
+/// Hand-rolled rather than pulling in serde: two booleans is not worth a dependency
+/// in a binary whose whole point is being small.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Settings {
+    /// Delete the index when the app closes.
+    pub clean_on_exit: bool,
+    /// Also delete the .eml files the app exported.
+    pub clean_exports: bool,
+}
+
+impl Settings {
+    pub fn path_for(db_path: &Path) -> PathBuf {
+        db_path.parent().unwrap_or_else(|| Path::new(".")).join("settings.json")
+    }
+
+    /// A missing, unreadable or malformed file yields the defaults (both off).
+    pub fn load(db_path: &Path) -> Self {
+        let Ok(text) = std::fs::read_to_string(Self::path_for(db_path)) else {
+            return Self::default();
+        };
+        Self {
+            clean_on_exit: json_flag(&text, "clean_on_exit"),
+            clean_exports: json_flag(&text, "clean_exports"),
+        }
+    }
+
+    pub fn save(&self, db_path: &Path) -> std::io::Result<PathBuf> {
+        let p = Self::path_for(db_path);
+        std::fs::write(
+            &p,
+            format!(
+                "{{\n  \"clean_on_exit\": {},\n  \"clean_exports\": {}\n}}\n",
+                self.clean_on_exit, self.clean_exports
+            ),
+        )?;
+        Ok(p)
+    }
+}
+
+/// True when `"key"` is present and its value begins with `true`.
+fn json_flag(text: &str, key: &str) -> bool {
+    let needle = format!("\"{key}\"");
+    text.find(&needle)
+        .and_then(|i| text[i + needle.len()..].trim_start().strip_prefix(':'))
+        .map(|rest| rest.trim_start().starts_with("true"))
+        .unwrap_or(false)
+}
+
+/// The folder exports are written into (sibling of the index database).
+pub fn export_dir_for(db_path: &Path) -> PathBuf {
+    db_path.parent().unwrap_or_else(|| Path::new(".")).join("exported")
+}
+
+#[derive(Default, Debug)]
+pub struct CleanReport {
+    pub removed: Vec<PathBuf>,
+    pub bytes: u64,
+    /// Files deliberately left alone, or that could not be removed.
+    pub skipped: Vec<String>,
+}
+
+impl CleanReport {
+    pub fn merge(&mut self, other: CleanReport) {
+        self.removed.extend(other.removed);
+        self.bytes += other.bytes;
+        self.skipped.extend(other.skipped);
+    }
+
+    pub fn describe(&self) -> String {
+        let mut s = if self.removed.is_empty() {
+            "nothing to remove".to_string()
+        } else {
+            format!(
+                "removed {} file(s), {:.1} KB",
+                self.removed.len(),
+                self.bytes as f64 / 1024.0
+            )
+        };
+        for p in &self.removed {
+            s.push_str(&format!("\n  - {}", p.display()));
+        }
+        for k in &self.skipped {
+            s.push_str(&format!("\n  ! {k}"));
+        }
+        s
+    }
+}
+
+/// Delete the index database and its SQLite sidecars. Only these exact paths are
+/// ever unlinked, so a shared or user-chosen folder is safe.
+pub fn clean_index(db_path: &Path) -> CleanReport {
+    let mut rep = CleanReport::default();
+    let mut targets = vec![db_path.to_path_buf()];
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut name = db_path.as_os_str().to_os_string();
+        name.push(suffix);
+        targets.push(PathBuf::from(name));
+    }
+    for t in targets {
+        remove_retrying(&t, &mut rep);
+    }
+    rep
+}
+
+/// Delete only the `.eml` files this app wrote into its export folder. Anything
+/// else in there (or in a subfolder) is left alone and reported.
+pub fn clean_exports(export_dir: &Path) -> CleanReport {
+    let mut rep = CleanReport::default();
+    let Ok(entries) = std::fs::read_dir(export_dir) else {
+        return rep; // nothing exported yet
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_eml = path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("eml"))
+            .unwrap_or(false);
+        if !is_eml || !path.is_file() {
+            rep.skipped.push(format!("kept (not an export): {}", path.display()));
+            continue;
+        }
+        remove_retrying(&path, &mut rep);
+    }
+    // tidy the folder away too, but only if it ended up empty
+    let _ = std::fs::remove_dir(export_dir);
+    rep
+}
+
+/// Everything the app created, per the caller's choice.
+pub fn clean_all(db_path: &Path, include_exports: bool) -> CleanReport {
+    let mut rep = clean_index(db_path);
+    if include_exports {
+        rep.merge(clean_exports(&export_dir_for(db_path)));
+    }
+    rep
+}
+
+/// Unlink a file, retrying briefly: on Windows another handle (a worker connection,
+/// a virus scanner) can hold it for a moment after it is written.
+fn remove_retrying(path: &Path, rep: &mut CleanReport) {
+    if !path.exists() {
+        return;
+    }
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    for attempt in 0..10 {
+        match std::fs::remove_file(path) {
+            Ok(()) => {
+                rep.bytes += size;
+                rep.removed.push(path.to_path_buf());
+                return;
+            }
+            Err(e) if attempt == 9 => {
+                rep.skipped.push(format!("could not delete {}: {e}", path.display()));
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(150)),
+        }
+    }
+}

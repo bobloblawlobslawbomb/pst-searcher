@@ -84,6 +84,9 @@ struct App {
     detail_body: String,
     status: String,
     export_dir: String,
+    settings: Settings,
+    /// Guard so the cleanup runs at most once per process.
+    cleaned_up: bool,
 }
 
 impl App {
@@ -94,10 +97,19 @@ impl App {
         note: Option<String>,
     ) -> Self {
         install_fonts(&cc.egui_ctx);
-        let export_dir = db_path
-            .parent()
-            .map(|p| p.join("exported"))
-            .unwrap_or_else(|| PathBuf::from("exported"));
+        let export_dir = export_dir_for(&db_path);
+        let argv: Vec<String> = std::env::args().collect();
+
+        // --clean-on-exit / --clean-exports force the cleanup for this run only, without
+        // changing the saved choice (scripted or one-off use).
+        let mut settings = Settings::load(&db_path);
+        if argv.iter().any(|a| a == "--clean-on-exit") {
+            settings.clean_on_exit = true;
+        }
+        if argv.iter().any(|a| a == "--clean-exports") {
+            settings.clean_exports = true;
+            settings.clean_on_exit = true;
+        }
 
         let mut app = Self {
             conn,
@@ -115,10 +127,11 @@ impl App {
             detail_body: String::new(),
             status: "Add PST files or a folder, then Index.".into(),
             export_dir: export_dir.display().to_string(),
+            settings,
+            cleaned_up: false,
         };
 
         // --paths <a.pst;b.pst|dir> preloads the source list (scripting / demos)
-        let argv: Vec<String> = std::env::args().collect();
         if let Some(i) = argv.iter().position(|a| a == "--paths") {
             if let Some(list) = argv.get(i + 1) {
                 let paths: Vec<PathBuf> = list
@@ -325,6 +338,44 @@ impl App {
         db_counts(&self.conn)
     }
 
+    fn save_settings(&mut self) {
+        match self.settings.save(&self.db_path) {
+            Ok(p) => self.log.push(format!("settings saved to {}", p.display())),
+            Err(e) => self.status = format!("could not save settings: {e}"),
+        }
+    }
+
+    /// Delete the files this app created, on the way out.
+    ///
+    /// Order is forced: our own connection - and, while indexing is still running, the
+    /// worker's - holds the database open, and Windows will not unlink an open file. So
+    /// wait briefly for the worker, close our handle, and only then delete. Swapping the
+    /// connection for an in-memory one drops the old handle without turning `conn` into
+    /// an Option at every one of its use sites.
+    fn cleanup_on_exit(&mut self) {
+        if self.cleaned_up {
+            return;
+        }
+        self.cleaned_up = true;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.busy && std::time::Instant::now() < deadline {
+            self.poll_worker();
+            if self.busy {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+
+        if let Ok(fresh) = Connection::open_in_memory() {
+            let old = std::mem::replace(&mut self.conn, fresh);
+            drop(old);
+        }
+        let report = clean_all(&self.db_path, self.settings.clean_exports);
+        // The window is on its way out, so there is nowhere to show this - but keep it on
+        // stderr for anyone who redirected it (`pst-searcher.exe 2>cleanup.log`).
+        eprintln!("cleanup on exit: {}", report.describe());
+    }
+
     fn do_search(&mut self) {
         match search(&self.conn, &self.query) {
             Ok(hits) => {
@@ -485,6 +536,9 @@ impl eframe::App for App {
         // "responding", ~210 MB) until it was killed. Nothing here needs flushing (SQLite
         // commits per file), so exit explicitly rather than trust the viewport teardown.
         if ui.ctx().input(|i| i.viewport().close_requested()) {
+            if self.settings.clean_on_exit {
+                self.cleanup_on_exit();
+            }
             std::process::exit(0);
         }
         self.poll_worker();
@@ -578,6 +632,47 @@ impl eframe::App for App {
                         .small(),
                 );
             }
+            ui.horizontal(|ui| {
+                let mut s = self.settings;
+                let mut changed = false;
+                if ui
+                    .checkbox(&mut s.clean_on_exit, "Delete the index when this window closes")
+                    .changed()
+                {
+                    if !s.clean_on_exit {
+                        // nothing to clean the exports for any more
+                        s.clean_exports = false;
+                    }
+                    changed = true;
+                }
+                let also_exports = s.clean_on_exit;
+                ui.add_enabled_ui(also_exports, |ui| {
+                    if ui
+                        .checkbox(&mut s.clean_exports, "…and the exported .eml files")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                });
+                if changed {
+                    self.settings = s;
+                    self.save_settings();
+                }
+                if self.settings.clean_on_exit {
+                    let what = if self.settings.clean_exports {
+                        "the index and its exported .eml files"
+                    } else {
+                        "the index"
+                    };
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "on close: remove {what} - your PST files are never touched"
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                }
+            });
             ui.add_space(4.0);
         });
 

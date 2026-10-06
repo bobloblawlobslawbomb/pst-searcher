@@ -12,20 +12,26 @@ fn main() {
             .and_then(|i| args.get(i + 1))
             .cloned()
     };
-    if args.iter().any(|a| a == "--help" || a == "-h") {
+    let has = |name: &str| args.iter().any(|a| a == name);
+    if has("--help") || has("-h") {
         println!(
-            "pst-cli [--db <index.db>] [--index <file-or-folder>] [--search <fts query>] [--counts]\n\n\
-             --index   index a .pst/.ost file, or every one under a folder\n\
-             --search  run an FTS5 query (AND/OR/NOT, field:value, \"phrase\", prefix*)\n\
-             --counts  print index size\n\n\
-             Without --db the index is taken from the program folder, falling back to\n\
-             %LOCALAPPDATA%\\PstSearcher when that folder is not writable."
+            "pst-cli [--db <index.db>] [--index <file-or-folder>] [--search <fts query>] [--counts]\n\
+             pst-cli [--db <index.db>] [--clean] [--clean-index] [--clean-exports]\n\n\
+             --index           index a .pst/.ost file, or every one under a folder\n\
+             --search          run an FTS5 query (AND/OR/NOT, field:value, \"phrase\", prefix*)\n\
+             --counts          print index size\n\
+             --clean           delete the index and the exported .eml files\n\
+             --clean-index     delete only the index (with its -wal/-shm sidecars)\n\
+             --clean-exports   delete only the exported .eml files\n\n\
+             Cleaning never touches the source PST/OST files. Without --db the index is\n\
+             taken from the program folder, falling back to %LOCALAPPDATA%\\PstSearcher\n\
+             when that folder is not writable."
         );
         return;
     }
 
     let explicit = flag("--db").map(PathBuf::from);
-    let (mut conn, db_path, note) = match open_index(explicit) {
+    let (conn, db_path, note) = match open_index(explicit) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("error: cannot open the index database: {e}");
@@ -36,6 +42,24 @@ fn main() {
         println!("note: {n}");
     }
 
+    // Cleaning is terminal: report it and stop. The connection has to be closed first or
+    // Windows refuses to unlink the file it holds open.
+    if has("--clean") || has("--clean-index") || has("--clean-exports") {
+        let want_index = has("--clean") || has("--clean-index");
+        let want_exports = has("--clean") || has("--clean-exports");
+        drop(conn);
+        let mut report = CleanReport::default();
+        if want_index {
+            report.merge(clean_index(&db_path));
+        }
+        if want_exports {
+            report.merge(clean_exports(&export_dir_for(&db_path)));
+        }
+        println!("{}", report.describe());
+        return;
+    }
+
+    let mut conn = conn;
     if let Some(p) = flag("--index") {
         let mut stats = Stats::default();
         index_path(&mut conn, Path::new(&p), &mut stats);
